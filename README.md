@@ -21,8 +21,8 @@ func main() {
 		PortHTTPS:       8443,
 		PortHTTP3:       8445,
 		ListenAddress:   "0.0.0.0",
-		CertPath:        "crt",
-		KeyPath:         "key",
+		CertPath:        "wb.ru.crt",
+		KeyPath:         "wb.ru.key",
 		ShutdownTimeout: 2,
 		EnableMTLS:      true //on mtls
 	})
