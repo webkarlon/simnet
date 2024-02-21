@@ -1,4 +1,4 @@
-package wpsev
+package sn
 
 import (
 	"context"
