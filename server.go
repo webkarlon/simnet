@@ -5,9 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"github.com/quic-go/quic-go/http3"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,10 +18,8 @@ import (
 type Server struct {
 	httpServer        *http.Server
 	httpsServer       *http.Server
-	http3Server       *http3.Server
 	PortHTTP          int
 	PortHTTPS         int
-	PortHTTP3         int
 	ListenAddress     string
 	patterns          map[string]map[string][]http.Handler
 	patternsMTLS      map[string]map[string][]http.Handler
@@ -48,7 +44,6 @@ func NewServer(server *Server) *Server {
 	return &Server{
 		PortHTTP:          server.PortHTTP,
 		PortHTTPS:         server.PortHTTPS,
-		PortHTTP3:         server.PortHTTP3,
 		ListenAddress:     server.ListenAddress,
 		patterns:          make(map[string]map[string][]http.Handler),
 		patternsMTLS:      make(map[string]map[string][]http.Handler),
@@ -93,20 +88,6 @@ func (s *Server) Start() error {
 
 	}
 
-	if s.PortHTTP3 > 0 {
-		s.http3Server = &http3.Server{
-			Addr:      fmt.Sprintf("%s:%d", s.ListenAddress, s.PortHTTP3),
-			Handler:   s.ServerMux,
-			TLSConfig: mtlsOpt,
-		}
-		go func() {
-			err = s.ListenAndServeHttp3(s.CertPath, s.KeyPath)
-			if err != nil {
-				log.Fatal(err)
-			}
-		}()
-	}
-
 	if s.PortHTTP > 0 {
 		s.httpServer = &http.Server{
 			Addr:              fmt.Sprintf("%s:%d", s.ListenAddress, s.PortHTTP),
@@ -116,16 +97,6 @@ func (s *Server) Start() error {
 			ReadHeaderTimeout: s.ReadHeaderTimeout,
 			WriteTimeout:      s.WriteTimeout,
 			IdleTimeout:       s.IdleTimeout,
-		}
-
-		if s.http3Server != nil {
-			s.httpServer.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				err = s.http3Server.SetQuicHeaders(w.Header())
-				if err != nil {
-					log.Fatal(err)
-				}
-				s.ServerMux.ServeHTTP(w, r)
-			})
 		}
 
 		go func() {
@@ -147,12 +118,6 @@ func (s *Server) Start() error {
 		}
 
 		s.httpsServer.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if s.http3Server != nil {
-				err = s.http3Server.SetQuicHeaders(w.Header())
-				if err != nil {
-					log.Fatal(err)
-				}
-			}
 			if s.EnableMTLS {
 				if len(r.TLS.PeerCertificates) > 0 {
 					r.Header.Set("user", r.TLS.PeerCertificates[0].Subject.CommonName)
@@ -224,10 +189,6 @@ func (s *Server) Stop() error {
 
 	if s.httpsServer != nil {
 		err = s.httpsServer.Shutdown(ctx)
-	}
-
-	if s.http3Server != nil {
-		err = s.http3Server.CloseGracefully(time.Duration(s.ShutdownTimeout) * time.Second)
 	}
 
 	return err
@@ -422,10 +383,6 @@ func (s *Server) ReloadTLS() error {
 			s.httpsServer.TLSConfig = tlsConfig
 		}
 
-		if s.http3Server != nil {
-			s.httpsServer.TLSConfig = tlsConfig
-		}
-
 	}
 	return nil
 }
@@ -443,36 +400,11 @@ func (s *Server) ListenAndServeHttp3(certFile, keyFile string) error {
 		return err
 	}
 
-	//s.http3Server.TLSConfig.Certificates = certs
-
-	udpAddr, err := net.ResolveUDPAddr("udp", s.http3Server.Addr)
-	if err != nil {
-		return err
-	}
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return err
-	}
-	defer udpConn.Close()
-
-	s.http3Server.Handler = s.ServerMux
 	hErr := make(chan error)
 	qErr := make(chan error)
-	go func() {
-		hErr <- http.ListenAndServeTLS(s.http3Server.Addr, certFile, keyFile, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if err := s.http3Server.SetQuicHeaders(w.Header()); err != nil {
-				log.Fatal(err)
-			}
-			s.http3Server.Handler.ServeHTTP(w, r)
-		}))
-	}()
-	go func() {
-		qErr <- s.http3Server.Serve(udpConn)
-	}()
 
 	select {
 	case err := <-hErr:
-		s.http3Server.Close()
 		return err
 	case err := <-qErr:
 		return err
