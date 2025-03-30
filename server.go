@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,13 +15,17 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/quic-go/quic-go/http3"
 )
 
 type Server struct {
 	httpServer        *http.Server
 	httpsServer       *http.Server
+	http3Server       *http3.Server
 	PortHTTP          int
 	PortHTTPS         int
+	PortHTTP3         int
 	ListenAddress     string
 	patterns          map[string]map[string][]http.Handler
 	patternsMTLS      map[string]map[string][]http.Handler
@@ -44,6 +50,7 @@ func NewServer(server *Server) *Server {
 	return &Server{
 		PortHTTP:          server.PortHTTP,
 		PortHTTPS:         server.PortHTTPS,
+		PortHTTP3:         server.PortHTTP3,
 		ListenAddress:     server.ListenAddress,
 		patterns:          make(map[string]map[string][]http.Handler),
 		patternsMTLS:      make(map[string]map[string][]http.Handler),
@@ -86,6 +93,30 @@ func (s *Server) Start() error {
 		mtlsOpt.ClientCAs = certPool
 		mtlsOpt.CipherSuites = allowedChipers
 
+	}
+
+	if s.PortHTTP3 > 0 {
+		s.http3Server = &http3.Server{
+			Addr:      fmt.Sprintf("%s:%d", s.ListenAddress, s.PortHTTP3),
+			Handler:   s.ServerMux,
+			TLSConfig: mtlsOpt,
+		}
+		go func() {
+			err = s.ListenAndServeHttp3(s.CertPath, s.KeyPath)
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatal(err)
+			}
+		}()
+	}
+
+	if s.http3Server != nil {
+		s.httpServer.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			err = s.http3Server.SetQuicHeaders(w.Header())
+			if err != nil {
+				log.Fatal(err)
+			}
+			s.ServerMux.ServeHTTP(w, r)
+		})
 	}
 
 	if s.PortHTTP > 0 {
@@ -139,43 +170,6 @@ func (s *Server) Start() error {
 	return err
 }
 
-//func (s *Server) StartMTLS(addr string, port int, certFile, keyFile string, tlsConfig *tls.Config) error {
-//	s.initRouter()
-//	addr = fmt.Sprintf("%s:%d", addr, port)
-//	var err error
-//
-//	switch s.versionHttp {
-//	case HTTP1:
-//		s.server1 = &http.Server{
-//			Addr:      addr,
-//			Handler:   s.server.Handler,
-//			TLSConfig: tlsConfig,
-//		}
-//		err = s.server1.ListenAndServeTLS(certFile, keyFile)
-//	case HTTP2:
-//		s.server2 = &http.Server{
-//			Addr:      addr,
-//			TLSConfig: tlsConfig,
-//		}
-//		err = http2.ConfigureServer(s.server2, &http2.Server{})
-//		if err != nil {
-//			break
-//		}
-//		err = s.server2.ListenAndServeTLS(certFile, keyFile)
-//	case HTTP3:
-//		s.server3 = &http3.Server{}
-//		s.server3.TLSConfig = tlsConfig
-//		err = s.ListenAndServeHttp3(addr, certFile, keyFile, s.server.Handler)
-//	default:
-//		err = fmt.Errorf("Wrong http protocol version: %d\n", s.versionHttp)
-//	}
-//
-//	if err == nil {
-//		s.tlsClose = true
-//	}
-//	return err
-//}
-
 func (s *Server) Stop() error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.ShutdownTimeout)*time.Second)
@@ -185,10 +179,20 @@ func (s *Server) Stop() error {
 
 	if s.httpServer != nil {
 		err = s.httpServer.Shutdown(ctx)
+		if err != nil {
+			return err
+		}
 	}
 
 	if s.httpsServer != nil {
 		err = s.httpsServer.Shutdown(ctx)
+		if err != nil {
+			return err
+		}
+	}
+
+	if s.http3Server != nil {
+		err = s.http3Server.CloseGracefully(time.Duration(s.ShutdownTimeout) * time.Second)
 	}
 
 	return err
@@ -383,6 +387,10 @@ func (s *Server) ReloadTLS() error {
 			s.httpsServer.TLSConfig = tlsConfig
 		}
 
+		if s.http3Server != nil {
+			s.httpsServer.TLSConfig = tlsConfig
+		}
+
 	}
 	return nil
 }
@@ -400,11 +408,36 @@ func (s *Server) ListenAndServeHttp3(certFile, keyFile string) error {
 		return err
 	}
 
+	udpAddr, err := net.ResolveUDPAddr("udp", s.http3Server.Addr)
+	if err != nil {
+		return err
+	}
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return err
+	}
+	defer udpConn.Close()
+
+	s.http3Server.Handler = s.ServerMux
+
 	hErr := make(chan error)
 	qErr := make(chan error)
 
+	go func() {
+		hErr <- http.ListenAndServeTLS(s.http3Server.Addr, certFile, keyFile, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if err := s.http3Server.SetQuicHeaders(w.Header()); err != nil {
+				log.Fatal(err)
+			}
+			s.http3Server.Handler.ServeHTTP(w, r)
+		}))
+	}()
+	go func() {
+		qErr <- s.http3Server.Serve(udpConn)
+	}()
+
 	select {
 	case err := <-hErr:
+		s.http3Server.Close()
 		return err
 	case err := <-qErr:
 		return err
